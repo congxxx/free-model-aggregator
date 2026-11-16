@@ -84,6 +84,9 @@ import {
   openAIModelList,
   openAIStreamWithModel,
   openAIToAnthropic,
+  textStream,
+  validateAndRepairOpenAIStream,
+  type DeclaredTools,
   type ServedModel,
 } from './lib/wire.ts';
 
@@ -152,12 +155,33 @@ const MAX_FAILURE_HEADER_ROWS = 8;
 const MAX_FAILURE_HEADER_BYTES = 8 * 1024;
 /** Pause between attempts, in milliseconds: short enough never to threaten the 30 s client timeout. */
 const RETRY_BACKOFF_MS = 100;
+/** One gateway call's whole budget, in milliseconds: the env aborts a prompt at 30 s, so a call
+ * that has not answered (or finished streaming) by 25 s is a lost prompt either way — fail over
+ * instead of lingering. The signal also bounds the body drain, so a stalled stream cannot hang. */
+const DIAL_TIMEOUT_MS = 25000;
+/** The longest a per-minute rate-limit wait may run, in milliseconds: the retry must still fit
+ * the client's 30 s budget after the wait. */
+const MAX_RATE_LIMIT_WAIT_MS = 20000;
+/** The wait when a per-minute refusal carries no usable reset window: a fixed, header-free guess. */
+const FALLBACK_RATE_LIMIT_WAIT_MS = 15000;
+
+/** What kind of refusal a gateway answer is: the failover policy branches on it. */
+type RefusalKind = 'daily_cap' | 'per_minute' | 'provider_rate_limit' | 'gateway_budget' | 'policy' | 'transient' | 'other';
 
 /** One refused gateway call, as the failover trail reports it. */
 interface UpstreamFailure {
   status: number;
   code: string;
   model: string | null;
+  /** Internal: the failover policy's branch. Stripped before the trail header is built. */
+  kind: RefusalKind;
+  /**
+   * Internal: for a per-minute 429, the milliseconds to wait before retrying the same model —
+   * computed purely from the response's own reset and date headers, never from the wall clock,
+   * so a replay waits exactly what the live pass waited. `null` means the window is more than
+   * MAX_RATE_LIMIT_WAIT_MS away: give up instead of waiting.
+   */
+  waitMs?: number | null;
 }
 
 /** Refusals per model id in this trial; a model that refused twice is cooling down. */
@@ -166,17 +190,80 @@ const refusalCounts = new Map<string, number>();
 /** Models the gateway refused with 403 this trial: a policy refusal, excluded for the trial. */
 const excludedModels = new Set<string>();
 
-/** A refusal worth one same-model retry: 429 or a 5xx (a caught network failure counts as 502). */
-function isTransientRefusal(status: number): boolean {
-  return status === 429 || status >= 500;
-}
-
 function isCoolingDown(id: string): boolean {
   return (refusalCounts.get(id) ?? 0) >= 2;
 }
 
 function recordRefusal(id: string): void {
   refusalCounts.set(id, (refusalCounts.get(id) ?? 0) + 1);
+}
+
+/**
+ * What a 429 means depends on why it was refused — the free tier's caps are account-wide, not
+ * per-model, so the policy must branch instead of retrying blindly:
+ * - a daily cap (`free-models-per-day`, or the daily limit source): nothing on this account can
+ *   serve until 00:00 UTC — give up at once;
+ * - the gateway's own budget (`request_cap`, `budget_exhausted`): the trial's budget is spent —
+ *   give up at once;
+ * - a provider refusing one model (`Provider returned error` + "temporarily rate-limited
+ *   upstream"): another model is immediately servable — fail over at once;
+ * - anything else 429: the account-wide per-minute burst — wait out the window, then retry the
+ *   same model once (another model would hit the same cap).
+ * A 403 is a policy refusal (the model is excluded for the trial); a 5xx is transient; any
+ * other status is neither.
+ */
+function classifyRefusal(status: number, code: string, message: string, limitSource: string, raw: string): RefusalKind {
+  if (status === 403) return 'policy';
+  if (status === 429) {
+    if (code === 'request_cap' || code === 'budget_exhausted') return 'gateway_budget';
+    const hay = `${message} ${limitSource} ${raw}`.toLowerCase();
+    if (hay.includes('per-day') || hay.includes('per_day') || limitSource.toLowerCase().includes('daily')) return 'daily_cap';
+    if (message.startsWith('Provider returned error') || hay.includes('temporarily rate-limited upstream')) return 'provider_rate_limit';
+    return 'per_minute';
+  }
+  if (status >= 500) return 'transient';
+  return 'other';
+}
+
+/** A reset instant as milliseconds since the epoch: a seconds epoch, a milliseconds epoch, or an HTTP date. */
+function parseResetTime(raw: string): number | null {
+  const n = Number(raw);
+  if (Number.isFinite(n) && n > 0) return n < 1e11 ? n * 1000 : n;
+  const d = Date.parse(raw);
+  return Number.isNaN(d) ? null : d;
+}
+
+/**
+ * How long to wait out a per-minute refusal, from the response's own headers: the reset instant
+ * minus the response's date, both recorded in the cassette, so a replay waits exactly what the
+ * live pass waited. `null` means give up: the window is more than 20 s away, or there is no
+ * reset header to compute a window from at all. A fixed 15 s only when the reset is known but
+ * the date is not (the window's end is known, "now" is not).
+ */
+function perMinuteWaitMs(headers: Headers): number | null {
+  const resetRaw = headers.get('x-ratelimit-reset');
+  if (resetRaw === null || resetRaw === '') return null;
+  const reset = parseResetTime(resetRaw);
+  if (reset === null) return null;
+  const dateRaw = headers.get('date');
+  if (dateRaw === null) return FALLBACK_RATE_LIMIT_WAIT_MS;
+  const dateMs = Date.parse(dateRaw);
+  if (Number.isNaN(dateMs)) return FALLBACK_RATE_LIMIT_WAIT_MS;
+  const remaining = reset - dateMs;
+  if (!Number.isFinite(remaining) || remaining <= 0) return 0;
+  if (remaining > MAX_RATE_LIMIT_WAIT_MS) return null;
+  return remaining;
+}
+
+/**
+ * A trail code that can ride an HTTP header: Node rejects header values outside Latin-1, and the
+ * rules read a trail over 8 KiB as no trail at all, so anything outside Latin-1 or a control
+ * character becomes '?', and the code is capped at 64 characters.
+ */
+function sanitizeTrailCode(code: string): string {
+  const latin1 = [...code].map((ch) => ((ch.codePointAt(0) ?? 0) <= 255 ? ch : '?')).join('');
+  const cleaned = latin1.replace(/[\u0000-\u001f\u007f]/g, '?');
+  return cleaned.length > 64 ? cleaned.slice(0, 64) : cleaned;
 }
 
 /** A pause between attempts; it never enters a request, so replays stay byte-identical. */
@@ -187,6 +274,9 @@ function sleep(ms: number): Promise<void> {
 /** One refused gateway response as a trail row: the code from its error body when parseable. */
 async function refusalOf(upstream: Response, model: string): Promise<UpstreamFailure> {
   let code = upstream.statusText !== '' ? upstream.statusText : 'upstream_error';
+  let message = '';
+  let limitSource = '';
+  let raw = '';
   let text = '';
   try {
     text = await upstream.text();
@@ -201,12 +291,20 @@ async function refusalOf(upstream: Response, model: string): Promise<UpstreamFai
         if (typeof errCode === 'string' && errCode !== '') code = errCode;
         else if (typeof errCode === 'number' && Number.isFinite(errCode)) code = String(errCode);
         else if (typeof parsed.error.type === 'string' && parsed.error.type !== '') code = parsed.error.type;
+        if (typeof parsed.error.message === 'string') message = parsed.error.message;
+        if (isRecord(parsed.error.metadata)) {
+          if (typeof parsed.error.metadata.limit_source === 'string') limitSource = parsed.error.metadata.limit_source;
+          if (typeof parsed.error.metadata.raw === 'string') raw = parsed.error.metadata.raw;
+        }
       }
     } catch {
       // Not JSON: the HTTP status text stands.
     }
   }
-  return { status: upstream.status, code, model };
+  const kind = classifyRefusal(upstream.status, code, message, limitSource, raw);
+  const failure: UpstreamFailure = { status: upstream.status, code: sanitizeTrailCode(code), model, kind };
+  if (kind === 'per_minute') failure.waitMs = perMinuteWaitMs(upstream.headers);
+  return failure;
 }
 
 /** The failover trail for a served prompt: a JSON array of at most 8 rows, at most 8 KiB. */
@@ -267,6 +365,9 @@ async function readJson(req: IncomingMessage): Promise<Json | null> {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
+  // A client that went away while the answer was being fetched leaves a destroyed response;
+  // writing to it would throw, so there is nothing to send.
+  if (res.destroyed) return;
   const text = JSON.stringify(body);
   res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text), ...extraHeaders });
   res.end(text);
@@ -291,59 +392,204 @@ async function dial(model: string, body: Json): Promise<Response> {
     authorization: `Bearer ${GATEWAY_KEY}`,
   };
   if (body.stream === true) headers.accept = 'text/event-stream';
-  return fetch(chatCompletionsUrl(), { method: 'POST', headers, body: JSON.stringify({ ...body, model }) });
+  return fetch(chatCompletionsUrl(), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ ...body, model }),
+    signal: AbortSignal.timeout(DIAL_TIMEOUT_MS),
+  });
+}
+
+/**
+ * The models that can serve a request, best first, in tiers. The strict requirements come
+ * first; when they have no untried model — every eligible model is cooling down, or none meets
+ * them at all — the list relaxes rather than giving up: the same requirements ignoring
+ * cooldowns, then the requirements without the context floor, then the best free model
+ * overall. A prompt with no eligible model is still served by the best free model rather
+ * than answered 503 with zero gateway calls. In the normal case the first tier is exactly
+ * routeFor, so the hot path is unchanged.
+ */
+function candidatesFor(requires: Requirement, tried: ReadonlySet<string>): ModelRow[] {
+  const tiers: ModelRow[][] = [routeFor(requires), rankedFor(requires).filter((m) => !excludedModels.has(m.id))];
+  if (requires.min_context !== undefined) {
+    const { min_context: _dropped, ...rest } = requires;
+    tiers.push(routeFor(rest), rankedFor(rest).filter((m) => !excludedModels.has(m.id)));
+  }
+  tiers.push(routeFor({}), rankedFor({}).filter((m) => !excludedModels.has(m.id)));
+  for (const tier of tiers) {
+    const list = tier.filter((m) => !tried.has(m.id));
+    if (list.length > 0) return list;
+  }
+  return [];
 }
 
 type DialOutcome =
-  | { ok: true; upstream: Response; model: ModelRow; failures: UpstreamFailure[] }
+  | { ok: true; model: ModelRow; failures: UpstreamFailure[]; stream: false; json: Json }
+  | { ok: true; model: ModelRow; failures: UpstreamFailure[]; stream: true; sseText: string }
   | { ok: false; failures: UpstreamFailure[] };
+
+/** A 200-with-error body as a refusal: the status from its numeric code, else 502. */
+function errorBodyFailure(parsed: Json, model: string): UpstreamFailure {
+  const err = parsed.error as Json;
+  const codeNum = typeof err.code === 'number' ? err.code : null;
+  const status = codeNum !== null && codeNum >= 400 && codeNum < 600 ? codeNum : 502;
+  const code =
+    typeof err.code === 'string' && err.code !== ''
+      ? err.code
+      : typeof err.code === 'number'
+        ? String(err.code)
+        : typeof err.type === 'string' && err.type !== ''
+          ? err.type
+          : 'upstream_error';
+  const message = typeof err.message === 'string' ? err.message : '';
+  const metadata = isRecord(err.metadata) ? err.metadata : {};
+  const limitSource = typeof metadata.limit_source === 'string' ? metadata.limit_source : '';
+  const raw = typeof metadata.raw === 'string' ? metadata.raw : '';
+  const kind = classifyRefusal(status, code, message, limitSource, raw);
+  const failure: UpstreamFailure = { status, code: sanitizeTrailCode(code), model, kind };
+  return failure;
+}
+
+/**
+ * A gateway JSON answer, validated before it is returned as served: an empty or malformed body,
+ * a top-level error object, or a body with no usable choice is a refusal the entry fails over
+ * from — not a 500 to the client and not a 200 carrying an error. A 200 with an error body
+ * keeps the error's own status and kind, so a daily cap inside one still gives up at once.
+ */
+function validateJsonAnswer(text: string, model: string, headers?: Headers): { ok: true; body: Json } | { ok: false; failure: UpstreamFailure } {
+  const malformed: UpstreamFailure = { status: 502, code: 'malformed_response', model, kind: 'transient' };
+  if (text.trim() === '') return { ok: false, failure: malformed };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { ok: false, failure: malformed };
+  }
+  if (!isRecord(parsed)) return { ok: false, failure: malformed };
+  if (isRecord(parsed.error)) {
+    const failure = errorBodyFailure(parsed, model);
+    if (failure.kind === 'per_minute' && headers !== undefined) failure.waitMs = perMinuteWaitMs(headers);
+    return { ok: false, failure };
+  }
+  if (!Array.isArray(parsed.choices) || parsed.choices.length === 0) return { ok: false, failure: malformed };
+  if (!isRecord(parsed.choices[0])) return { ok: false, failure: malformed };
+  return { ok: true, body: parsed };
+}
+
+/**
+ * A gateway answer, drained and validated before it is returned as served. A stream is read
+ * fully first (buffer-then-relay): nothing reaches the client until the whole upstream body is
+ * known to be a complete, well-formed stream, so a mid-stream death or a mid-stream error event
+ * is a refusal the entry fails over from instead of a half answer the client cannot use. The
+ * drain is bounded by the fetch's own timeout signal. The parsed JSON body (or the repaired
+ * SSE text) rides the outcome, so the handlers never re-parse it.
+ */
+async function validateUpstreamBody(
+  upstream: Response,
+  model: ModelRow,
+  stream: boolean,
+  declaredTools: DeclaredTools,
+): Promise<{ ok: true; json: Json; stream: false } | { ok: true; sseText: string; stream: true } | { ok: false; failure: UpstreamFailure }> {
+  let text: string;
+  try {
+    text = await upstream.text();
+  } catch {
+    return { ok: false, failure: { status: 502, code: 'upstream_error', model: model.id, kind: 'transient' } };
+  }
+  if (!stream) {
+    const validated = validateJsonAnswer(text, model.id, upstream.headers);
+    if (!validated.ok) return { ok: false, failure: validated.failure };
+    return { ok: true, json: validated.body, stream: false };
+  }
+  const repaired = validateAndRepairOpenAIStream(text, declaredTools);
+  if (repaired === null) {
+    return { ok: false, failure: { status: 502, code: 'upstream_stream_error', model: model.id, kind: 'transient' } };
+  }
+  return { ok: true, sseText: repaired, stream: true };
+}
 
 /**
  * Serve one prompt through the gateway, spending at most MAX_ATTEMPTS_PER_PROMPT calls. The best
- * candidate goes first; a transient refusal (429/5xx) earns that model one same-model retry, then
- * the attempt fails over to the next untried candidate, then the one after. A 403 is a policy
- * refusal, not a transient one: the model is excluded for the rest of the trial and the attempt
- * fails over at once, without burning a retry on a model the gateway will refuse again. Any other
- * 4xx likewise fails over at once — retrying the same model with the same body would refuse again.
+ * candidate goes first. What a refusal does next depends on its kind, not just its status:
+ * - a daily cap or the gateway's own budget: give up at once — no model on this account can
+ *   serve until the cap resets, and every further call is a certain refusal;
+ * - a per-minute burst: wait out the window (from the response's own headers, capped at 20 s),
+ *   then retry the SAME model once — another model would hit the same account-wide cap; a
+ *   window over 20 s away, or a second per-minute refusal after the wait, gives up at once;
+ * - a provider refusing one model: fail over at once, no same-model retry — another model is
+ *   immediately servable, and the model is not excluded (the refusal is transient);
+ * - a 5xx or a network failure: one same-model retry, then fail over;
+ * - a 403: the model is excluded for the rest of the trial and the attempt fails over at once,
+ *   without burning a retry on a model the gateway will refuse again. Any other 4xx likewise
+ *   fails over at once.
  * Every refusal is recorded, for the trail and for cooldowns; a model that refuses twice cools
- * down for later prompts.
+ * down for later prompts. A malformed or truncated answer is a refusal like any other: the
+ * attempt fails over instead of handing the client a broken answer.
  */
-async function dialWithFailover(requires: Requirement, buildBody: (model: string) => Json): Promise<DialOutcome> {
+async function dialWithFailover(requires: Requirement, buildBody: (model: string) => Json, declaredTools: DeclaredTools): Promise<DialOutcome> {
   const failures: UpstreamFailure[] = [];
   const tried = new Set<string>();
   let retriedOnce = false;
-  let last: { model: ModelRow; status: number } | null = null;
+  let waitedOnce = false;
+  let last: { model: ModelRow; kind: RefusalKind; status: number; waitMs: number | null } | null = null;
   for (let attempt = 0; attempt < MAX_ATTEMPTS_PER_PROMPT; attempt++) {
-    const candidates = routeFor(requires);
     let model: ModelRow | undefined;
-    if (last !== null && isTransientRefusal(last.status) && !retriedOnce) {
-      // The same-model retry looks at the unfiltered ranking: the just-refused model may
-      // already be cooling down for later prompts, and that must not cancel this prompt's retry.
-      model = rankedFor(requires).find((c) => c.id === last.model.id);
-      if (model !== undefined) retriedOnce = true;
+    let waitMs = 0;
+    if (last !== null) {
+      if (last.kind === 'daily_cap' || last.kind === 'gateway_budget') break;
+      if (last.kind === 'per_minute') {
+        if (waitedOnce || last.waitMs === null) break;
+        waitMs = last.waitMs;
+        waitedOnce = true;
+        model = freeModels(brief).find((c) => c.id === last.model.id);
+      } else if (last.kind === 'transient' && !retriedOnce) {
+        model = freeModels(brief).find((c) => c.id === last.model.id);
+        if (model !== undefined) retriedOnce = true;
+      }
+      // provider_rate_limit, policy, other: fail over at once (model stays undefined).
     }
-    if (model === undefined) model = candidates.find((c) => !tried.has(c.id));
+    if (model === undefined) model = candidatesFor(requires, tried)[0];
     if (model === undefined) break;
     tried.add(model.id);
-    if (attempt > 0) await sleep(RETRY_BACKOFF_MS);
+    if (waitMs > 0) await sleep(waitMs);
+    else if (attempt > 0) await sleep(RETRY_BACKOFF_MS);
+    const reqBody = buildBody(model.id);
+    const stream = reqBody.stream === true;
     let upstream: Response;
     try {
-      upstream = await dial(model.id, buildBody(model.id));
+      upstream = await dial(model.id, reqBody);
     } catch {
-      failures.push({ status: 502, code: 'upstream_error', model: model.id });
+      const failure: UpstreamFailure = { status: 502, code: 'upstream_error', model: model.id, kind: 'transient' };
+      failures.push(failure);
       recordRefusal(model.id);
-      last = { model, status: 502 };
+      last = { model, kind: 'transient', status: 502, waitMs: null };
       continue;
     }
-    if (upstream.ok && upstream.body !== null) return { ok: true, upstream, model, failures };
-    const failure =
-      upstream.ok && upstream.body === null
-        ? { status: upstream.status, code: 'empty_response', model: model.id }
-        : await refusalOf(upstream, model.id);
-    failures.push(failure);
-    recordRefusal(model.id);
-    if (failure.status === 403) excludedModels.add(model.id);
-    last = { model, status: failure.status };
+    if (!upstream.ok) {
+      const failure = await refusalOf(upstream, model.id);
+      failures.push(failure);
+      recordRefusal(model.id);
+      if (failure.status === 403) excludedModels.add(model.id);
+      last = { model, kind: failure.kind, status: failure.status, waitMs: failure.waitMs ?? null };
+      continue;
+    }
+    if (upstream.body === null) {
+      const failure: UpstreamFailure = { status: 502, code: 'empty_response', model: model.id, kind: 'transient' };
+      failures.push(failure);
+      recordRefusal(model.id);
+      last = { model, kind: 'transient', status: 502, waitMs: null };
+      continue;
+    }
+    const validated = await validateUpstreamBody(upstream, model, stream, declaredTools);
+    if (!validated.ok) {
+      failures.push(validated.failure);
+      recordRefusal(model.id);
+      if (validated.failure.status === 403) excludedModels.add(model.id);
+      last = { model, kind: validated.failure.kind, status: validated.failure.status, waitMs: validated.failure.waitMs ?? null };
+      continue;
+    }
+    if (validated.stream) return { ok: true, model, failures, stream: true, sseText: validated.sseText };
+    return { ok: true, model, failures, stream: false, json: validated.json };
   }
   return { ok: false, failures };
 }
@@ -357,58 +603,94 @@ function refused(res: ServerResponse, wire: 'openai' | 'anthropic', status: numb
   }
 }
 
+/** The tool names a client declared, as a set: an answer may only name these. */
+function declaredToolsOf(body: Json): DeclaredTools {
+  if (!Array.isArray(body.tools)) return new Set<string>();
+  const names = new Set<string>();
+  for (const raw of body.tools) {
+    if (!isRecord(raw)) continue;
+    if (typeof raw.name === 'string' && raw.name !== '') names.add(raw.name);
+    else if (isRecord(raw.function) && typeof raw.function.name === 'string' && raw.function.name !== '') names.add(raw.function.name);
+  }
+  return names;
+}
+
+/**
+ * An OpenAI-shaped body's output cap, normalised the way anthropicToOpenAI already does: the
+ * gateway refuses a call with no cap (or one over 8192), so a missing cap defaults to 1024 and
+ * an oversized one is pulled back to 8192. `max_completion_tokens` is the same cap under the
+ * other name: it is read when `max_tokens` is absent, then dropped so the gateway never sees
+ * two caps.
+ */
+function normalizeOpenAICap(body: Json): Json {
+  const out: Json = { ...body };
+  const cap = typeof body.max_tokens === 'number' ? body.max_tokens : typeof body.max_completion_tokens === 'number' ? body.max_completion_tokens : undefined;
+  out.max_tokens = typeof cap === 'number' && Number.isFinite(cap) && cap > 0 ? Math.min(cap, 8192) : 1024;
+  delete out.max_completion_tokens;
+  return out;
+}
+
 /** POST /v1/chat/completions: an OpenAI-shaped client, answered by the best free model that meets it. */
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const outcome = await dialWithFailover(requirementsFor(body), (model) => ({ ...body, model }));
+  const normalized = normalizeOpenAICap(body);
+  const declared = declaredToolsOf(body);
+  const outcome = await dialWithFailover(requirementsFor(body), (model) => ({ ...normalized, model }), declared);
   if (!outcome.ok) {
     const last = outcome.failures[outcome.failures.length - 1];
     if (last === undefined) return sendError(res, 'openai', 503, 'no_free_model', 'no free model in the brief meets this request');
     return refused(res, 'openai', last.status, last.code);
   }
-  const { upstream, model, failures } = outcome;
-  if (upstream.body === null) return sendError(res, 'openai', 502, 'upstream_error', 'the gateway answered with no body');
+  const { model, failures } = outcome;
   const trail = failuresHeader(failures);
   const trailHeaders = trail === '' ? {} : { 'x-makefun-upstream-failures': trail };
-  if (body.stream === true) {
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', ...trailHeaders });
+  if (outcome.stream) {
     try {
-      for await (const frame of openAIStreamWithModel(upstream.body, model.id)) res.write(frame);
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', ...trailHeaders });
+      for await (const frame of openAIStreamWithModel(textStream(outcome.sseText), model.id)) {
+        if (res.destroyed) break;
+        res.write(frame);
+      }
+    } catch {
+      // The client went away mid-stream: nothing left to send.
     } finally {
-      res.end();
+      if (!res.writableEnded) res.end();
     }
     return;
   }
-  const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, model.id), trailHeaders);
+  sendJson(res, 200, openAIJsonWithModel(outcome.json, model.id, declared), trailHeaders);
 }
 
 /** POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back. */
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const outcome = await dialWithFailover(requirementsFor(body), (model) => anthropicToOpenAI(body, model));
+  const declared = declaredToolsOf(body);
+  const outcome = await dialWithFailover(requirementsFor(body), (model) => anthropicToOpenAI(body, model), declared);
   if (!outcome.ok) {
     const last = outcome.failures[outcome.failures.length - 1];
     if (last === undefined) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request');
     return refused(res, 'anthropic', last.status, last.code);
   }
-  const { upstream, model, failures } = outcome;
-  if (upstream.body === null) return sendError(res, 'anthropic', 502, 'api_error', 'the gateway answered with no body');
+  const { model, failures } = outcome;
   const trail = failuresHeader(failures);
   const trailHeaders = trail === '' ? {} : { 'x-makefun-upstream-failures': trail };
-  if (body.stream === true) {
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', ...trailHeaders });
+  if (outcome.stream) {
     try {
-      for await (const event of anthropicEventsFromOpenAI(upstream.body, model.id)) res.write(event);
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', ...trailHeaders });
+      for await (const event of anthropicEventsFromOpenAI(textStream(outcome.sseText), model.id)) {
+        if (res.destroyed) break;
+        res.write(event);
+      }
+    } catch {
+      // The client went away mid-stream: nothing left to send.
     } finally {
-      res.end();
+      if (!res.writableEnded) res.end();
     }
     return;
   }
-  const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, model.id), trailHeaders);
+  sendJson(res, 200, openAIToAnthropic(outcome.json, model.id, declared), trailHeaders);
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -435,17 +717,54 @@ function listen(server: Server): Promise<void> {
   });
 }
 
-/** POST /register with the port and the one catalog; the env answers with the trial's prompt count. */
+/**
+ * POST /register with the port and the one catalog; the env answers with the trial's prompt
+ * count. One 5xx, timeout or refused connection used to end the trial before a single prompt
+ * (exit 1, score 0); registration is retried instead — up to 4 attempts, 500 ms apart — and
+ * only the last failure throws. Registration happens before any prompt is served, so the
+ * retries cost nothing but a few seconds of the wall.
+ */
 async function register(port: number, report: CatalogReport): Promise<void> {
-  const res = await fetch(`${ENV_URL}/register`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog: report }),
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!res.ok) throw new Error(`POST ${ENV_URL}/register answered HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
-  const reply: unknown = await res.json();
-  if (isRecord(reply) && typeof reply.requests === 'number') log(`registered: the trial holds ${reply.requests} prompts`);
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (attempt > 0) await sleep(500);
+    try {
+      const res = await fetch(`${ENV_URL}/register`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog: report }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) throw new Error(`POST ${ENV_URL}/register answered HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
+      const reply: unknown = await res.json();
+      if (isRecord(reply) && typeof reply.requests === 'number') log(`registered: the trial holds ${reply.requests} prompts`);
+      return;
+    } catch (err) {
+      lastError = err;
+      log(`register attempt ${attempt + 1} failed: ${(err as Error).message ?? String(err)}`);
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Listen on 0.0.0.0 at a free port that is not 8080 (the env's on one layout). The OS's
+ * ephemeral range never holds 8080, so the first listen almost always stands; if it ever
+ * lands on 8080 the server is closed and another port is tried instead of failing the trial.
+ */
+async function listenOnFreePort(handler: (req: IncomingMessage, res: ServerResponse) => void): Promise<{ server: Server; port: number }> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const server = createServer(handler);
+    try {
+      await listen(server);
+    } catch {
+      continue;
+    }
+    const address = server.address();
+    if (address !== null && typeof address !== 'string' && address.port !== 8080) return { server, port: address.port };
+    server.close();
+  }
+  throw new Error('could not listen on a port other than 8080');
 }
 
 /** Poll GET /work every 100 ms; exit 0 the moment it says done. */
@@ -484,18 +803,12 @@ async function start(): Promise<void> {
   }
   if (ENV_URL === '') throw new Error('MAKEFUN_ENV_URL is not set');
   if (chatCompletionsUrl() === '') throw new Error('OPENAI_BASE_URL is not set');
-  const server = createServer((req, res) => {
+  const { server, port } = await listenOnFreePort((req, res) => {
     void handle(req, res).catch((err: unknown) => {
       log((err as Error).stack ?? String(err));
       if (!res.headersSent) sendError(res, req.url?.startsWith('/v1/messages') === true ? 'anthropic' : 'openai', 500, 'internal_error', 'the server failed to answer');
     });
   });
-  await listen(server);
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('the server has no port');
-  const port = address.port;
-  // 8080 is the env's on one layout; the OS's ephemeral range never holds it, and the guard says so.
-  if (port === 8080) throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
   log(`listening on 0.0.0.0:${port} with ${servedModels().length} free models`);
   await register(port, catalog);
   process.on('SIGTERM', () => process.exit(0));

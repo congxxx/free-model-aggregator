@@ -220,14 +220,14 @@ function numberOrZero(value: unknown): number {
 }
 
 /** A Chat Completions answer as an Anthropic Messages object. `model` is the id the entry dialled. */
-export function openAIToAnthropic(body: Json, model: string): Json {
+export function openAIToAnthropic(body: Json, model: string, declaredTools: DeclaredTools = null): Json {
   const choices = Array.isArray(body.choices) ? body.choices : [];
   const choice = isRecord(choices[0]) ? choices[0] : {};
   const message = isRecord(choice.message) ? choice.message : {};
   const content: Json[] = [];
   const text = typeof message.content === 'string' ? message.content : textOf(message.content);
   if (text !== '') content.push({ type: 'text', text });
-  const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  const calls = declaredToolCalls(message.tool_calls, declaredTools);
   for (const call of calls) {
     if (!isRecord(call) || !isRecord(call.function)) continue;
     content.push({
@@ -256,9 +256,47 @@ export function openAIToAnthropic(body: Json, model: string): Json {
   };
 }
 
+/** The finish reasons the client wires accept. Anything else (notably "error") is a refusal, not an answer. */
+const LEGAL_FINISH_REASONS = new Set(['stop', 'length', 'tool_calls', 'function_call', 'content_filter']);
+
+/**
+ * The tool names a client declared, as a set: a tool call whose name is not in it is not the
+ * client's, so it must not reach the client. `null` means "do not filter" (callers that do not
+ * know the declared names); an empty set drops every tool call.
+ */
+export type DeclaredTools = ReadonlySet<string> | null;
+
+/** A Chat Completions answer's tool calls, keeping only the ones the client declared. */
+function declaredToolCalls(calls: unknown, declared: DeclaredTools): Json[] {
+  if (!Array.isArray(calls)) return [];
+  return calls.flatMap((call) => {
+    if (!isRecord(call) || !isRecord(call.function)) return [];
+    if (declared !== null && typeof call.function.name === 'string' && !declared.has(call.function.name)) return [];
+    return [call];
+  });
+}
+
 /** A Chat Completions answer with `model` set to the id the entry dialled: the one truthful claim. */
-export function openAIJsonWithModel(body: Json, model: string): Json {
-  return { ...body, model };
+export function openAIJsonWithModel(body: Json, model: string, declaredTools: DeclaredTools = null): Json {
+  const out: Json = { ...body, model };
+  const choices = Array.isArray(body.choices) ? body.choices : [];
+  const choice = isRecord(choices[0]) ? choices[0] : {};
+  const message = isRecord(choice.message) ? choice.message : {};
+  const keptCalls = declaredToolCalls(message.tool_calls, declaredTools);
+  if (declaredTools !== null && Array.isArray(message.tool_calls)) {
+    out.choices = choices.map((c, i) => (i === 0 && isRecord(c) ? { ...c, message: { ...message, tool_calls: keptCalls } } : c));
+  }
+  // The wire check needs an output count of at least 1. A completion that produced text or a tool
+  // call really spent at least one output token, so a missing or zero count from upstream is a
+  // reporting gap, not a zero: report 1. (The Anthropic path already floors the same way.)
+  const text = typeof message.content === 'string' ? message.content : textOf(message.content);
+  const produced = text !== '' || keptCalls.length > 0;
+  if (produced) {
+    const usage = isRecord(body.usage) ? { ...body.usage } : {};
+    if (numberOrZero(usage.completion_tokens) <= 0) usage.completion_tokens = 1;
+    out.usage = usage;
+  }
+  return out;
 }
 
 /** One server-sent event: `event: <name>` when named, then the JSON data line, then the blank line. */
@@ -286,6 +324,133 @@ function frameWithModel(frame: string, model: string): string {
     return line;
   });
   return `${lines.join('\n')}\n\n`;
+}
+
+/**
+ * Validate a drained Chat Completions SSE body and repair what the client wire would reject.
+ * Returns the repaired SSE text, or null when the stream is unusable and the entry should fail
+ * over instead of relaying it: a mid-stream death (no finish chunk), a finish_reason the wires
+ * do not accept (notably "error", the shape a mid-stream rate limit takes), a data line that is
+ * not JSON, or a stream that produced no content and no tool call at all (an empty answer cannot
+ * carry the prompt's token, so another model deserves the attempt). Repairs: later `[DONE]`
+ * frames are dropped, a missing `[DONE]` is appended after the finish chunk, a missing usage
+ * chunk is synthesised (output floored to 1 when content was produced), and tool-call deltas
+ * naming a tool the client never declared are removed (by call index, so a name chunk and its
+ * argument chunks go together). Double finish chunks are left alone: openAIStreamWithModel
+ * already merges them into exactly one. This is a pure function of the drained text, so a
+ * replay sees the same bytes.
+ */
+export function validateAndRepairOpenAIStream(text: string, declaredTools: DeclaredTools = null): string | null {
+  const folded = text.replace(/\r\n/g, '\n');
+  const rawFrames = folded.split('\n\n').filter((f) => f.trim() !== '');
+  const kept: string[] = [];
+  const droppedIndexes = new Set<number>();
+  let lastToolIndex = 0;
+  let sawContent = false;
+  let sawFinish = false;
+  let sawUsage = false;
+  let sawDone = false;
+  let keptToolCall = false;
+  let firstChunk: Json | null = null;
+
+  for (const frame of rawFrames) {
+    const lines = frame.split('\n');
+    const dataLines = lines.filter((line) => line.trim().startsWith('data:'));
+    const otherLines = lines.filter((line) => !line.trim().startsWith('data:'));
+    if (dataLines.length === 0) {
+      kept.push(frame);
+      continue;
+    }
+    let isDone = false;
+    const rebuiltData: string[] = [];
+    for (const line of dataLines) {
+      const payload = line.trim().slice(5).trim();
+      if (payload === '') continue;
+      if (payload === '[DONE]') {
+        isDone = true;
+        continue;
+      }
+      let chunk: unknown;
+      try {
+        chunk = JSON.parse(payload);
+      } catch {
+        return null; // A data line that is not JSON: the stream is malformed.
+      }
+      if (!isRecord(chunk)) return null;
+      if (isRecord(chunk.error)) return null; // A top-level error mid-stream is a refusal.
+      if (firstChunk === null) firstChunk = chunk;
+      if (isRecord(chunk.usage)) sawUsage = true;
+      const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+      const first = isRecord(choices[0]) ? choices[0] : null;
+      if (first !== null) {
+        const delta = isRecord(first.delta) ? first.delta : null;
+        if (delta !== null) {
+          if (typeof delta.content === 'string' && delta.content !== '') sawContent = true;
+          if (Array.isArray(delta.tool_calls)) {
+            const keptCalls: Json[] = [];
+            for (const call of delta.tool_calls) {
+              if (!isRecord(call)) continue;
+              const idx = typeof call.index === 'number' ? call.index : lastToolIndex;
+              lastToolIndex = idx;
+              const fn = isRecord(call.function) ? call.function : null;
+              const name = fn !== null && typeof fn.name === 'string' ? fn.name : '';
+              if (name !== '' && declaredTools !== null && !declaredTools.has(name)) droppedIndexes.add(idx);
+              if (droppedIndexes.has(idx)) continue;
+              keptCalls.push(call);
+            }
+            if (keptCalls.length > 0) {
+              sawContent = true;
+              keptToolCall = true;
+            }
+            if (keptCalls.length === 0) delete (delta as Record<string, unknown>).tool_calls;
+            else (delta as Record<string, unknown>).tool_calls = keptCalls;
+          }
+        }
+        const finish = first.finish_reason;
+        if (finish !== null && finish !== undefined) {
+          if (typeof finish !== 'string' || !LEGAL_FINISH_REASONS.has(finish)) return null;
+          // A finish of tool_calls with no tool call left (all were dropped as undeclared)
+          // would claim a tool call that is not there: the answer is really a text answer.
+          if (finish === 'tool_calls' && !keptToolCall) first.finish_reason = 'stop';
+          sawFinish = true;
+        }
+      }
+      rebuiltData.push(`data: ${JSON.stringify(chunk)}`);
+    }
+    if (isDone) {
+      if (sawDone) continue; // Drop a second [DONE]: the client counts them.
+      sawDone = true;
+      kept.push('data: [DONE]');
+      continue;
+    }
+    if (rebuiltData.length === 0) continue; // A frame that lost every line (all tool calls dropped).
+    kept.push([...otherLines, ...rebuiltData].join('\n'));
+  }
+
+  if (!sawFinish) return null; // Truncated: no finish chunk, so no complete answer.
+  if (!sawContent) return null; // Empty: no content and no (declared) tool call to carry the token.
+  if (!sawUsage) {
+    const id = firstChunk !== null && typeof firstChunk.id === 'string' ? firstChunk.id : 'chatcmpl-repair';
+    const created = firstChunk !== null && typeof firstChunk.created === 'number' ? firstChunk.created : 0;
+    const usageFrame = `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, choices: [], usage: { prompt_tokens: 0, completion_tokens: 1, total_tokens: 1 } })}`;
+    // The usage chunk goes before [DONE]: the client reads usage from the frames before it.
+    const doneIdx = kept.findIndex((f) => f.trim() === 'data: [DONE]');
+    if (doneIdx !== -1) kept.splice(doneIdx, 0, usageFrame);
+    else kept.push(usageFrame);
+  }
+  if (!sawDone) kept.push('data: [DONE]');
+  return `${kept.join('\n\n')}\n\n`;
+}
+
+/** One drained SSE body as a one-shot stream, for the translators that read from a stream. */
+export function textStream(text: string): ReadableStream<Uint8Array> {
+  const bytes = new TextEncoder().encode(text);
+  return new ReadableStream({
+    start(c) {
+      c.enqueue(bytes);
+      c.close();
+    },
+  });
 }
 
 /**
