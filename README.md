@@ -36,7 +36,6 @@ Both API wires run on the single ephemeral port the process binds, after it regi
 - `main.ts` — entrypoint: server, registration, model choice, failover, handlers
 - `lib/wire.ts` — both API wires: translation, streaming, finish-chunk repair, tool filtering
 - `lib/providers.ts` — the free-model catalog and the gateway dial
-- `python/main.py` — the Python starter alternative (not the entrypoint)
 
 ## License
 
